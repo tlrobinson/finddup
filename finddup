@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+
+var FS = require("fs");
+var PATH = require("path");
+var CRYPTO = require("crypto");
+
+// A little heirarchical data structure to find duplicate items based on any provided criteria
+function MatcherNode(criteria) {
+    this.items = [];
+    this.children = null;
+    this.criteria = criteria;
+}
+MatcherNode.prototype.insert = function(item) {
+    this.items.push(item);
+    // only push items into child nodes once there are more than one that match
+    if (this.items.length > 1) {
+        if (this.items.length === 2) {
+            this.pushDown(this.items[0]);
+        }
+        this.pushDown(item);
+    }
+}
+MatcherNode.prototype.pushDown = function(item) {
+    var result = this.getCriteria(item);
+    if (result !== null) {
+        if (!this.children) {
+            this.children = {};
+        }
+        if (!this.children[result]) {
+            this.children[result] = new MatcherNode(this.criteria.slice(1));
+        }
+        this.children[result].insert(item);
+    } else {
+        if (this.items.length > 1) {
+            console.log("Duplicates ("+this.items.length+"):\n    "+this.items.join("\n    "));
+        }
+    }
+}
+// null indicates criteria does not apply / end of criteria
+MatcherNode.prototype.getCriteria = function(item) {
+    return this.criteria[0] ? this.criteria[0](item) : null;
+}
+MatcherNode.prototype.print = function() {
+    if (!this.children) {
+        if (this.items.length > 1) {
+            console.log(this.items);
+        }
+    } else {
+        Object.keys(this.children).forEach(function(key) {
+            this.children[key].print();
+        }, this);
+    }
+}
+
+// generic memoize on first argument
+function memoize(fn) {
+    var cache = {};
+    return function() {
+        var key = Array.prototype.join.call(arguments, ",")
+        if (!cache[key]) {
+            cache[key] = fn.apply(this, arguments);
+            // console.log("miss", fn.name, arguments);
+        } else {    
+            // console.log("hit", fn.name, arguments);
+        }
+        return cache[key];
+    }
+}
+
+var getBuffer = memoize(function getBuffer(size) {
+    return new Buffer(size);
+});
+
+var fileStat = memoize(function fileStat(path) {
+    return FS.statSync(path);
+});
+
+function fileSize(path) {
+    var stat = fileStat(path);
+    return stat.isFile() ? stat.size : null;
+}
+
+// TODO: optimize these
+function fileHash(path) {
+    var stat = fileStat(path);
+    if (stat.isFile()) {
+        var hash = CRYPTO.createHash("md5");
+        hash.update(FS.readFileSync(path));
+        return hash.digest("hex");
+    } else {
+        return null;
+    }
+}
+function fileHashPartial(offset, length, path) {
+    var stat = fileStat(path);
+    if (stat.isFile() && offset < stat.size) {
+        var hash = CRYPTO.createHash("md5");
+        var fd = FS.openSync(path, "r");
+        
+        var realLength = Math.min(length, stat.size - offset);
+        var buffer = new Buffer(realLength);
+        var actual = FS.readSync(fd, buffer, 0, realLength, offset);
+        if (actual !== realLength) {
+            console.warn("actual", actual, "realLength", realLength, "length", length);
+        }
+        FS.closeSync(fd);
+        hash.update(buffer);
+        return hash.digest("hex");
+    } else {
+        return null;
+    }
+}
+
+function main(directories) {
+
+    var criteria = [fileSize];
+    for (var o = 0, s = 4096; o < 1000000000; o += s, s *= 2) {
+        criteria.push(fileHashPartial.bind(null, o, s));
+    }
+
+    var matcher = new MatcherNode(criteria);
+    // var matcher = new MatcherNode([fileSize, fileHash]);
+
+    function addFile(path) {
+        matcher.insert(path);
+    }
+    function addDir(dir) {
+        FS.readdirSync(dir).forEach(function(name) {
+            var path = PATH.join(dir, name);
+            var stat = fileStat(path);
+            if (stat.isFile()) {
+                addFile(path);
+            } else if (stat.isDirectory()) {
+                addDir(path);
+            }
+        });
+    }
+
+    directories.forEach(addDir)
+
+    matcher.print();
+}
+
+main(process.argv.slice(2));
